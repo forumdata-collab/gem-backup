@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Gem Backup 網頁 — 用戶俾 public Drive gem folder URL → xlsx (+zip), 30 分鐘自動刪."""
-import json, os, re, threading, time, uuid, zipfile
+import hashlib, json, os, re, threading, time, uuid, zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import requests
@@ -9,11 +10,13 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
+VERSION = '1.2.0'
 BASE = '/tmp/gembackup'
 TTL = 30 * 60            # 檔案保留 30 分鐘
 CELL_MAX = 30000         # Excel cell 上限 32767，留 buffer
 MAX_FILE = 200 * 1024 * 1024    # 單一附件上限
 MAX_TOTAL = 1024 * 1024 * 1024  # 每 job 總量上限（有 enforce）
+MAX_DISK = 5 * 1024 * 1024 * 1024  # /tmp/gembackup 全局上限
 MAX_ACTIVE = 4
 MAX_DEPTH = 2            # 子 folder 遞歸深度
 
@@ -103,26 +106,29 @@ def dedupe_name(base, used):
     return f'{base}_{used[base]-1}'
 
 
-def _stream(r, dest, cap):
+def _stream(r, dest, cap, h=None):
     total = 0
     with open(dest, 'wb') as f:
         for chunk in r.iter_content(1 << 16):
             total += len(chunk)
             if total > cap: raise RuntimeError('file too large')
+            if h: h.update(chunk)
             f.write(chunk)
     if total == 0: raise RuntimeError('empty download')
 
 
 def dl_to_file(fid, dest, cap=MAX_FILE):
     url = f'https://drive.google.com/uc?export=download&id={fid}'
-    with requests.get(url, stream=True, timeout=60) as r:
+    h = hashlib.sha256()
+    with requests.get(url, stream=True, timeout=(10, 60)) as r:
         if r.headers.get('Content-Type', '').startswith('text/html') and 'confirm' in r.text:
             m = re.search(r'confirm=([0-9A-Za-z_-]+)', r.text)
             if not m: raise RuntimeError('confirm token not found')
-            with requests.get(url, params={'confirm': m.group(1)}, stream=True, timeout=120) as r2:
-                _stream(r2, dest, cap)
+            with requests.get(url, params={'confirm': m.group(1)}, stream=True, timeout=(10, 120)) as r2:
+                _stream(r2, dest, cap, h)
         else:
-            _stream(r, dest, cap)
+            _stream(r, dest, cap, h)
+    return h.hexdigest()
 
 
 def classify(href):
@@ -132,25 +138,34 @@ def classify(href):
     return None
 
 
-def list_folder(folder_id, depth=0, seen=None):
+def fetch_folder(folder_id, depth=0, seen=None):
+    """Return (folder_name, [Entry...]). Subfolders recursed, cycle-guarded."""
     if depth > MAX_DEPTH:
-        return []
+        return '', []
     seen = seen if seen is not None else set()
     if folder_id in seen:
-        return []
+        return '', []
     seen.add(folder_id)
     r = requests.get(f'https://drive.google.com/embeddedfolderview?id={folder_id}#list', timeout=30)
     r.raise_for_status()
+    name = ''
+    m = re.search(r'<title>([^<]*)</title>', r.text)
+    if m:
+        name = m.group(1).replace(' - Google Drive', '').strip()
     out = []
-    for fid, href, name, mtime in ENTRY_RE.findall(r.text):
+    for fid, href, e_name, mtime in ENTRY_RE.findall(r.text):
         kind = classify(href)
         if kind is None:
             continue
         if kind == 'folder':
-            out.extend(list_folder(fid, depth + 1, seen))
+            out.extend(fetch_folder(fid, depth + 1, seen)[1])
         else:
-            out.append(Entry(fid, name.strip(), mtime.strip(), kind))
-    return out
+            out.append(Entry(fid, e_name.strip(), mtime.strip(), kind))
+    return name, out
+
+
+def list_folder(folder_id):
+    return fetch_folder(folder_id)[1]
 
 
 def split_cell(s):
@@ -159,27 +174,42 @@ def split_cell(s):
     return [s[i:i + CELL_MAX] for i in range(0, len(s), CELL_MAX)]
 
 
-def make_xlsx(rows, dest):
-    wb = Workbook(); ws = wb.active; ws.title = 'Gems'
-    headers = ['名稱', '描述 (Description)', '指示 (Instructions / System Prompt)', 'Gem 連結', '最後修改']
-    ws.append(headers)
-    for c in range(1, 6):
+def make_xlsx(rows, dest, manifest):
+    wb = Workbook()
+    ws = wb.active; ws.title = 'Manifest'
+    ws.append(['欄位', '數值'])
+    for c in range(1, 3):
         cell = ws.cell(row=1, column=c); cell.font = Font(bold=True)
+    for k, v in manifest.items():
+        ws.append([k, v])
+    ws.column_dimensions['A'].width = 22
+    ws.column_dimensions['B'].width = 48
+    for row in ws.iter_rows(min_row=2):
+        row[1].alignment = Alignment(vertical='top', wrap_text=True)
+
+    ws2 = wb.create_sheet('Gems')
+    headers = ['名稱', '描述 (Description)', '指示 (Instructions / System Prompt)',
+               'Gem 連結', 'File ID', '最後修改', '狀態']
+    ws2.append(headers)
+    for c in range(1, 8):
+        cell = ws2.cell(row=1, column=c); cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical='top')
     for row in rows:
         descs, instrs = split_cell(row.desc), split_cell(row.instr)
         n = max(len(descs), len(instrs))
         for i in range(n):
-            ws.append([
+            ws2.append([
                 row.name if i == 0 else '',
                 descs[i] if i < len(descs) else '',
                 ('【續上】' + instrs[i]) if i > 0 and i < len(instrs) else (instrs[i] if i < len(instrs) else ''),
                 f'https://gemini.google.com/gem/{row.fid}' if i == 0 else '',
+                row.fid if i == 0 else '',
                 row.mtime if i == 0 else '',
+                'OK' if i == 0 else '',
             ])
-    for i, w in enumerate([24, 60, 90, 45, 22], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    for r in ws.iter_rows(min_row=2):
+    for i, w in enumerate([24, 50, 80, 40, 26, 18, 8], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    for r in ws2.iter_rows(min_row=2):
         for cell in r:
             cell.alignment = Alignment(vertical='top', wrap_text=True)
     wb.save(dest)
@@ -190,44 +220,98 @@ def set_state(job_id, **kw):
     json.dump(st, open(os.path.join(BASE, job_id, 'state.json'), 'w'))
 
 
+def disk_usage():
+    total = 0
+    if not os.path.isdir(BASE): return 0
+    for name in os.listdir(BASE):
+        p = os.path.join(BASE, name)
+        for root, dirs, files in os.walk(p):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return total
+
+
 def build_package(job_id, folder_id):
     jd = os.path.join(BASE, job_id)
-    entries = list_folder(folder_id)
+    folder_name, entries = fetch_folder(folder_id)
     if not entries:
         raise RuntimeError('Folder 未公開或不存在 — 請喺 Drive 將 folder 設為「Anyone with the link」')
     gems = [e for e in entries if e.kind == 'gem']
     atts = [e for e in entries if e.kind == 'file']
     total = 0
     rows = []
+    gem_meta = []
+    failed = []
     for e in gems:
         dest = os.path.join(jd, 'raw_' + e.fid)
-        dl_to_file(e.fid, dest)
-        total += os.path.getsize(dest)
+        digest = dl_to_file(e.fid, dest)
+        size = os.path.getsize(dest)
+        total += size
         if total > MAX_TOTAL: raise RuntimeError('檔案總量超過 1GB 上限')
         parsed = parse_gem(open(dest, 'rb').read()) or [(e.name, '', '')]
         os.unlink(dest)
         rows += [GemRow(n or e.name, d, i, e.fid, e.mtime) for n, d, i in parsed]
+        gem_meta.append({'name': e.name, 'drive_id': e.fid, 'modified': e.mtime,
+                         'size': size, 'sha256': digest, 'status': 'ok'})
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    manifest = {
+        'tool': 'gem-backup', 'version': VERSION, 'backup_time': now,
+        'source_folder': {'id': folder_id, 'name': folder_name or folder_id},
+        'gems': gem_meta,
+        'attachments': [],
+        'counts': {'gems': len(gem_meta), 'attachments': len(atts)},
+        'total_size': 0, 'failed': failed,
+    }
     xlsx_path = os.path.join(jd, 'Gems_Backup.xlsx')
-    make_xlsx(rows, xlsx_path)
+    make_xlsx(rows, xlsx_path, {
+        'Backup time': now, 'Tool version': VERSION,
+        'Source folder name': folder_name or folder_id,
+        'Source folder ID': folder_id,
+        'Gems found': len(gem_meta), 'Attachments': len(atts),
+        'Total size (MB)': round(total / 1048576, 1),
+        'Failed files': len(failed),
+    })
     files = [{'name': 'Gems_Backup.xlsx', 'size': os.path.getsize(xlsx_path)}]
     if atts:
-        zip_path = os.path.join(jd, 'Gems_Attachments.zip')
+        zip_path = os.path.join(jd, 'Gems_Backup.zip')
         used = {}
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('gem-backup/manifest.json', json.dumps(manifest, ensure_ascii=False, indent=1))
+            for idx, meta in enumerate(gem_meta, 1):
+                gdir = f'gem-backup/gems/gem-{idx:03d}'
+                z.writestr(f'{gdir}/metadata.json', json.dumps(
+                    {'index': idx, **{k: meta[k] for k in ('name', 'drive_id', 'modified', 'status')}},
+                    ensure_ascii=False, indent=1))
+                row = rows[idx - 1]
+                z.writestr(f'{gdir}/instructions.txt', row.instr)
+                z.writestr(f'{gdir}/description.txt', row.desc)
             for e in atts:
                 dest = os.path.join(jd, 'att_' + e.fid)
                 try:
-                    dl_to_file(e.fid, dest)
-                    total += os.path.getsize(dest)
+                    digest = dl_to_file(e.fid, dest)
+                    size = os.path.getsize(dest)
+                    total += size
                     if total > MAX_TOTAL: raise RuntimeError('檔案總量超過 1GB 上限')
-                    z.write(dest, dedupe_name(sanitize(e.name), used))
+                    zname = dedupe_name(sanitize(e.name), used)
+                    z.write(dest, f'gem-backup/attachments/{zname}')
+                    manifest['attachments'].append(
+                        {'name': zname, 'original_name': e.name, 'drive_id': e.fid,
+                         'size': size, 'sha256': digest})
                     os.unlink(dest)
                 except RuntimeError:
                     raise
                 except Exception:
+                    failed.append(e.name)
                     try: os.unlink(dest)
                     except OSError: pass
-        files.append({'name': 'Gems_Attachments.zip', 'size': os.path.getsize(zip_path)})
+        manifest['total_size'] = total
+        z2 = zipfile.ZipFile(zip_path, 'a')
+        z2.writestr('gem-backup/manifest.json', json.dumps(manifest, ensure_ascii=False, indent=1))
+        z2.close()
+        files.append({'name': 'Gems_Backup.zip', 'size': os.path.getsize(zip_path)})
     set_state(job_id, state='done', files=files, summary=f'{len(rows)} 個 Gem × {len(atts)} 個附件')
 
 
@@ -272,7 +356,12 @@ PAGE = """<!doctype html>
 body{margin:0;background:#0f1115;color:#e6e6e6;font-family:-apple-system,'Segoe UI',Roboto,'Noto Sans TC',sans-serif;min-height:100vh}
 .wrap{max-width:680px;margin:0 auto;padding:48px 20px}
 h1{font-size:26px;font-weight:600;margin:0 0 6px}
-p.sub{color:#8b93a7;margin:0 0 28px;font-size:14px;line-height:1.6}
+p.sub{color:#8b93a7;margin:0 0 26px;font-size:14px;line-height:1.6}
+.steps{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 22px}
+.step{flex:1;min-width:170px;background:#161a22;border:1px solid #2a3040;border-radius:10px;padding:14px}
+.step b{display:block;color:#9fd0ff;font-size:13px;margin-bottom:6px}
+.step span{font-size:14px;line-height:1.5}
+.trust{color:#7dffa9;font-size:13px;margin:0 0 24px;line-height:1.8}
 input{width:100%;box-sizing:border-box;padding:14px 16px;border-radius:10px;border:1px solid #2a3040;background:#161a22;color:#fff;font-size:15px;outline:none}
 input:focus{border-color:#4a6cf7}
 button{margin-top:14px;width:100%;padding:14px;border:0;border-radius:10px;background:#4a6cf7;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
@@ -284,11 +373,17 @@ a.dl{display:inline-block;margin:8px 8px 0 0;padding:10px 18px;border-radius:8px
 .note{color:#5c6475;font-size:12px;margin-top:20px;line-height:1.7}
 </style></head><body><div class="wrap">
 <h1>Gem Backup</h1>
-<p class="sub">貼上你嘅 Google Drive Gemini Gem folder 連結（folder 要設為「Anyone with the link」），伺服器會將所有 Gem 整合成 Excel (.xlsx)，附件一併打包成 .zip 俾你下載。檔案只保留 30 分鐘。</p>
+<p class="sub">喺 Gemini Gems 消失之前，將你嘅自訂指令完整保留下嚟。</p>
+<div class="steps">
+<div class="step"><b>① 貼上 Folder</b><span>將你公開嘅 Google Drive Gem folder 連結貼喺下面</span></div>
+<div class="step"><b>② Backup</b><span>伺服器自動下載 + 分析每個 Gem 嘅指令</span></div>
+<div class="step"><b>③ 下載</b><span>Excel 整合 + 附件 ZIP，一撳即攞</span></div>
+</div>
+<p class="trust">無登入 · 無 Google API · 無 AI · 檔案 30 分鐘後自動刪除</p>
 <input id="url" placeholder="https://drive.google.com/drive/folders/XXXX" autocomplete="off">
 <button id="go">開始 Backup</button>
 <div id="status"></div>
-<p class="note">Gem 係 Gemini 嘅自訂指令。2026 年 10 月起 Google 停止 Gems 功能，呢個工具幫你將 Gem 嘅指令完整保留下嚟。<br>伺服器唔儲存任何內容 — 30 分鐘後自動刪除。</p>
+<p class="note">Folder 要設為「Anyone with the link」先可以用。<br>伺服器唔儲存任何內容 — 30 分鐘後自動刪除。</p>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -369,6 +464,8 @@ class H(BaseHTTPRequestHandler):
         m = FOLDER_RE.search(d.get('url', ''))
         if not m: self._json({'error': '唔係有效嘅 Drive folder link'}, 400); return
         with _lock:
+            if disk_usage() > MAX_DISK:
+                self._json({'error': '伺服器磁碟暫時滿載，請稍後再試'}, 507); return
             active = len(_active)
             if active >= MAX_ACTIVE: self._json({'error': 'Server 繁忙，請稍後再試'}, 429); return
             job = uuid.uuid4().hex

@@ -43,14 +43,19 @@ if TEST_FOLDER:
 else:
     print('  skip (set TEST_FOLDER_ID to verify against a live folder)')
 
-# ── 3. make_xlsx 長 cell chunking ──
-print('[3] xlsx >32767 chunking')
+# ── 3. make_xlsx 長 cell chunking + manifest sheet ──
+print('[3] xlsx >32767 chunking + manifest sheet')
 long_instr = 'A' * 40000
 long_desc = 'B' * 35000
 from openpyxl import load_workbook
 tmp = '/tmp/sanity.xlsx'
-app.make_xlsx([app.GemRow('LongGem', long_desc, long_instr, 'fid123', 'Aug 1')], tmp)
-ws = load_workbook(tmp).active
+app.make_xlsx([app.GemRow('LongGem', long_desc, long_instr, 'fid123', 'Aug 1')], tmp,
+              {'Backup time': '2026-08-18T00:00:00+00:00', 'Tool version': app.VERSION,
+               'Source folder name': 'My Gems', 'Source folder ID': 'fld1',
+               'Gems found': 1, 'Attachments': 0, 'Total size (MB)': 0.1, 'Failed files': 0})
+wb = load_workbook(tmp)
+ok(wb.sheetnames == ['Manifest', 'Gems'], f'sheets = Manifest + Gems (got {wb.sheetnames})')
+ws = wb['Gems']
 ok(ws.max_row == 3, f'3 rows (1 + 2 continuations), got {ws.max_row}')
 maxlen = 0; joined = ''
 for r in ws.iter_rows(min_row=2, max_col=3):
@@ -65,6 +70,11 @@ ok(desc_joined == long_desc, f'desc lossless ({len(desc_joined)} chars)')
 ok(instr_joined == long_instr, f'instr lossless ({len(instr_joined)} chars)')
 ok(ws.cell(3, 3).value.startswith('【續上】'), 'continuation marker present')
 ok(ws.cell(2, 4).value == 'https://gemini.google.com/gem/fid123', 'link only on first chunk')
+ok(ws.cell(2, 5).value == 'fid123', 'Drive file ID column')
+mws = wb['Manifest']
+vals = {mws.cell(r, 1).value: mws.cell(r, 2).value for r in range(2, mws.max_row + 1)}
+ok(vals.get('Tool version') == app.VERSION and vals.get('Source folder name') == 'My Gems'
+   and vals.get('Gems found') == 1, 'manifest sheet fields')
 
 # ── 4. dedupe_name ──
 print('[4] zip name dedupe')
@@ -120,5 +130,44 @@ ok(app.job_state('') is None, 'empty job rejected')
 ok(app.FOLDER_RE.search('https://drive.google.com/drive/u/0/folders/AbC123?usp=sharing').group(1) == 'AbC123', 'u/0 URL variant')
 ok(app.FOLDER_RE.search('https://drive.google.com/drive/folders/xyz_123') is not None, 'bare folder URL')
 ok(app.FOLDER_RE.search('https://evil.com/drive/folders/xyz') is None, 'non-google URL rejected')
+
+# ── 7. build_package offline: zip tree + manifest.json + disk_usage ──
+print('[7] build_package offline (zip tree + manifest)')
+import shutil, zipfile
+app.BASE = '/tmp/gembackup_test'
+shutil.rmtree(app.BASE, ignore_errors=True); os.makedirs(app.BASE)
+orig_fetch, orig_dl = app.fetch_folder, app.dl_to_file
+app.fetch_folder = lambda fid: ('My Gems', [
+    app.Entry('g1', 'Gem1', 'Jun 1', 'gem'),
+    app.Entry('a1', 'doc.pdf', 'Jun 2', 'file')])
+def fake_dl(fid, dest, cap=app.MAX_FILE):
+    if fid == 'g1':
+        open(dest, 'wb').write(b'\x12\x10\n\x04Gem1\x12\x02hi\x1a\x04body')
+    else:
+        open(dest, 'wb').write(b'fake')
+    return 'ab' * 32
+app.dl_to_file = fake_dl
+try:
+    os.makedirs(os.path.join(app.BASE, 'testjob'), exist_ok=True)
+    app.build_package('testjob', 'fld123')
+    jd = os.path.join(app.BASE, 'testjob')
+    z = zipfile.ZipFile(os.path.join(jd, 'Gems_Backup.zip'))
+    names = z.namelist()
+    ok('gem-backup/manifest.json' in names, 'zip has manifest.json')
+    ok('gem-backup/gems/gem-001/metadata.json' in names
+       and 'gem-backup/gems/gem-001/instructions.txt' in names
+       and 'gem-backup/gems/gem-001/description.txt' in names, 'zip gem tree')
+    ok('gem-backup/attachments/doc.pdf' in names, 'zip attachment')
+    man = json.loads(z.read('gem-backup/manifest.json'))
+    ok(man['counts']['gems'] == 1 and man['counts']['attachments'] == 1, 'manifest json counts')
+    ok(man['source_folder']['name'] == 'My Gems' and man['source_folder']['id'] == 'fld123', 'source folder in manifest')
+    ok(man['tool'] == 'gem-backup' and man['version'] == app.VERSION, 'tool + version in manifest')
+    ok(len(man['attachments'][0]['sha256']) == 64 and man['attachments'][0]['original_name'] == 'doc.pdf', 'sha256 + original name')
+    ok(man['gems'][0]['drive_id'] == 'g1' and man['gems'][0]['status'] == 'ok', 'gem drive_id + status')
+    ok(app.disk_usage() > 0, 'disk_usage counts job bytes')
+finally:
+    app.fetch_folder, app.dl_to_file = orig_fetch, orig_dl
+    app.BASE = '/tmp/gembackup'
+    shutil.rmtree('/tmp/gembackup_test', ignore_errors=True)
 
 print(f'\nALL {PASS} CHECKS PASSED')
