@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Gem Backup — save your Gemini Gems (custom instructions) as Excel before Google sunsets them in October 2026. Open source, MIT licensed.">
+<title>Gem Backup · Save your Gemini Gems</title>
+<style>
+body{margin:0;background:#0f1115;color:#e6e6e6;font-family:-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif;min-height:100vh}
+.wrap{max-width:760px;margin:0 auto;padding:56px 24px}
+h1{font-size:30px;font-weight:700;margin:0 0 8px}
+.tag{display:inline-block;background:#2a3040;color:#9aa4bf;font-size:12px;padding:4px 10px;border-radius:20px;margin-bottom:20px}
+p{line-height:1.7;color:#c7cdd9}
+a{color:#7d9bff;text-decoration:none}
+.btn{display:inline-block;background:#4a6cf7;color:#fff!important;font-weight:600;padding:14px 28px;border-radius:10px;margin:8px 8px 0 0}
+.btn.gh{background:#1c212c;border:1px solid #2a3040}
+h2{font-size:20px;margin:40px 0 12px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:14px;background:#161a22;border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid #232937}
+th{color:#9aa4bf;font-weight:600;background:#1a1f2a}
+code{background:#1a1f2a;padding:2px 7px;border-radius:5px;font-size:13px;color:#9fd0ff}
+.note{color:#5c6475;font-size:13px;margin-top:32px}
+</style></head><body><div class="wrap">
+<h1>Gem Backup</h1>
+<span class="tag">Open Source · MIT License</span>
+<p>Google is sunsetting <b>Gems</b> (custom Gemini instructions) in <b>October 2026</b>. Paste a public Google Drive folder URL and Gem Backup packages every Gem's name, description and full system prompt into a clean <code>.xlsx</code> — plus a <code>.zip</code> of any attachments. Files auto-delete after 30 minutes.</p>
+<a class="btn" href="https://gembackup.hermesagent.de5.net">Open the Tool</a>
+<a class="btn gh" href="https://github.com/forumdata-collab/gem-backup">Source on GitHub</a>
+
+<h2>Why this exists</h2>
+<p>Before October 2026 — or any time you tidy your Gemini library — you should own your Gems as plain, portable data. Downloading them manually one by one is tedious; this service does it in one click with no account, no OAuth, no AI involved.</p>
+
+<h2>How it works</h2>
+<table>
+<tr><th>Step</th><th>What happens</th></tr>
+<tr><td>1. List</td><td>Public folder parsed via Google's <code>embeddedfolderview</code> endpoint (no API key)</td></tr>
+<tr><td>2. Download</td><td>Each Gem + attachment streamed via the public <code>uc?export=download</code> endpoint</td></tr>
+<tr><td>3. Parse</td><td>Gem files are protobuf — name, description and instructions extracted with a small decoder</td></tr>
+<tr><td>4. Package</td><td>Excel with 32,767-char-safe cell chunking + attachment zip</td></tr>
+<tr><td>5. Handout</td><td>Both files downloadable for 30 minutes, then deleted from the server</td></tr>
+</table>
+
+<h2>Requirements</h2>
+<p>Just one: the folder must be shared as <b>Anyone with the link</b> (Viewer). Everything else is handled automatically.</p>
+
+<div class="note">Gem Backup is unaffiliated with Google. Gems and Gemini are trademarks of Google LLC.</div>
+</div></body></html>
